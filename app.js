@@ -303,6 +303,93 @@ function createMcpServer() {
     }
   );
 
+  server.tool(
+    "rentman_search_equipment",
+    "Search Rentman equipment/inventory items by free-text query (matches name, displayname, or " +
+      "code — Rentman's API has no server-side text search, so this scans equipment client-side). " +
+      "Use this to find an item's internal id before calling rentman_equipment_inventory, or to " +
+      "browse inventory by category/brand keyword.",
+    {
+      query: z.string().describe("Text to match against item name/displayname/code, e.g. 'Moab Sofa'"),
+      limit: z.number().optional().default(20),
+      scan_pages: z.number().optional().default(25).describe("How many 300-item pages of equipment to scan (our inventory is ~5,200 items / ~18 pages, so this defaults high enough to cover all of it)")
+    },
+    async ({ query, limit, scan_pages }) => {
+      const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+      const matches = [];
+      let pages = 0;
+
+      while (pages < scan_pages) {
+        const res = await fetch(
+          `${RENTMAN_BASE}/equipment?limit=300&offset=${pages * 300}`,
+          { headers: { Authorization: `Bearer ${RENTMAN_TOKEN}`, Accept: "application/json" } }
+        );
+        const body = await res.json();
+        if (!res.ok) throw new Error(`Rentman API error (HTTP ${res.status}): ${JSON.stringify(body)}`);
+
+        for (const item of body.data || []) {
+          const haystack = `${item.displayname || ""} ${item.name || ""} ${item.code || ""}`.toLowerCase();
+          if (tokens.every((t) => haystack.includes(t))) {
+            matches.push({
+              id: item.id,
+              name: item.displayname || item.name,
+              code: item.code,
+              price: item.price,
+              rental_sales: item.rental_sales,
+              stock_management: item.stock_management
+            });
+          }
+        }
+
+        pages += 1;
+        if (!body.data || body.data.length < 300) break; // reached the end of all equipment
+        if (matches.length >= limit * 3) break; // enough candidates, stop scanning early
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { pages_scanned: pages, match_count: matches.length, results: matches.slice(0, limit) },
+              null,
+              2
+            )
+          }
+        ]
+      };
+    }
+  );
+
+  server.tool(
+    "rentman_equipment_inventory",
+    "Get how many units of an equipment item we own, by internal equipment id. Uses Rentman's " +
+      "own current_quantity field (its actual stock count for that item) plus, for individually " +
+      "serialized/asset-tracked items, a count of registered serial numbers as a cross-check. " +
+      "Use rentman_search_equipment first to find the id if you only have a name.",
+    { equipment_id: z.number() },
+    async ({ equipment_id }) => {
+      const [item, total, active] = await Promise.all([
+        rentmanRequest(`/equipment/${equipment_id}`),
+        rentmanRequest("/serialnumbers", { params: { equipment: `/equipment/${equipment_id}`, limit: 1 } }),
+        rentmanRequest("/serialnumbers", { params: { equipment: `/equipment/${equipment_id}`, active: 1, limit: 1 } })
+      ]);
+
+      const summary = {
+        equipment_id,
+        name: item.data?.displayname || item.data?.name,
+        code: item.data?.code,
+        stock_management: item.data?.stock_management,
+        current_quantity: item.data?.current_quantity,
+        current_quantity_excl_cases: item.data?.current_quantity_excl_cases,
+        registered_serial_numbers: total.meta?.itemCount ?? total.data.length,
+        active_serial_numbers: active.meta?.itemCount ?? active.data.length
+      };
+
+      return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+    }
+  );
+
   return server;
 }
 
